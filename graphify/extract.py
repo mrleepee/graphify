@@ -10743,6 +10743,218 @@ def extract_terraform(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# ── XQuery extractor ──────────────────────────────────────────────────────────
+
+_XQUERY_SO_PATH = Path(os.environ.get(
+    "TREE_SITTER_XQUERY_SO",
+    str(Path.home() / "Dev" / "LLM" / "tree-sitter-xquery" / "xquery.so"),
+))
+
+_ML_BUILTIN_PREFIXES: frozenset[str] = frozenset({
+    "cts", "xdmp", "fn", "math", "map", "sem", "spell", "triple",
+    "dbg", "prof", "sec", "admin", "info", "alert",
+    "json", "jsonx", "sql", "search", "zip", "cpf",
+    "pki", "temporal", "entity", "es", "tde", "geo", "geojson",
+    "lsqt", "oo", "forest", "trigger", "task", "view",
+    "xs", "xsi", "svg", "math", "err", "local",
+})
+
+
+def _load_xquery_language():
+    """Load XQuery tree-sitter language — try pip package, then local .so."""
+    import ctypes
+    from tree_sitter import Language
+    try:
+        import tree_sitter_xquery as tsxq
+        return Language(tsxq.language())
+    except ImportError:
+        pass
+    so = Path(_XQUERY_SO_PATH)
+    if not so.exists():
+        return None
+    lib = ctypes.CDLL(str(so))
+    fn = lib.tree_sitter_xquery
+    fn.restype = ctypes.c_void_p
+    return Language(fn())
+
+
+def extract_xquery(path: Path) -> dict:
+    """Extract functions, variables, imports, and calls from XQuery (.xqy) files."""
+    from tree_sitter import Parser as _TSParser
+
+    lang = _load_xquery_language()
+    if lang is None:
+        return {"nodes": [], "edges": [], "error": "tree-sitter-xquery not installed"}
+
+    try:
+        parser = _TSParser(lang)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    if root.has_error:
+        errors: list[str] = []
+        def _collect_errors(node):
+            if node.type == "ERROR":
+                text = source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")[:80]
+                errors.append(f"L{node.start_point[0]+1}:{node.start_point[1]} — {text!r}")
+            for c in node.children:
+                _collect_errors(c)
+        _collect_errors(root)
+        return {"nodes": [], "edges": [], "error": f"parse errors: {'; '.join(errors[:5])}"}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    ns_prefixes: dict[str, str] = {}
+    func_ids: dict[str, str] = {}
+
+    def add_node(nid: str, label: str, line: int, **metadata) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            node = {"id": nid, "label": label, "file_type": "code",
+                    "source_file": str_path, "source_location": f"L{line}"}
+            if metadata:
+                node["metadata"] = metadata
+            nodes.append(node)
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def _xq_qname(node) -> tuple[str | None, str | None, str | None]:
+        """Extract prefix:localname from a node with identifier children."""
+        ids = [c for c in node.children if c.type == "identifier"]
+        if len(ids) >= 2:
+            prefix = _read_text(ids[0], source)
+            localname = _read_text(ids[1], source)
+            return f"{prefix}:{localname}", prefix, localname
+        if len(ids) == 1:
+            localname = _read_text(ids[0], source)
+            return localname, None, localname
+        return None, None, None
+
+    def _xq_string(node) -> str | None:
+        for c in node.children:
+            if c.type == "char_data":
+                return _read_text(c, source)
+        return None
+
+    def _xq_param_count(param_list_node) -> int:
+        return sum(1 for c in param_list_node.children if c.type == "$")
+
+    file_nid = _make_id(str_path)
+    add_node(file_nid, path.name, 1)
+
+    # ── Pass 1: collect declarations and imports ──────────────────────────
+
+    def collect_declarations(node) -> None:
+        t = node.type
+        if t == "module_declaration":
+            ids = [c for c in node.children if c.type == "identifier"]
+            strs = [c for c in node.children if c.type == "string_literal"]
+            if ids and strs:
+                prefix = _read_text(ids[0], source)
+                uri = _xq_string(strs[0])
+                if prefix and uri:
+                    ns_prefixes[prefix] = uri
+                    line = node.start_point[0] + 1
+                    mod_nid = _make_id(stem, "module", prefix)
+                    add_node(mod_nid, f"module:{prefix}", line, uri=uri, prefix=prefix)
+                    add_edge(file_nid, mod_nid, "contains", line)
+
+        elif t == "module_import":
+            ids = [c for c in node.children if c.type == "identifier"]
+            strs = [c for c in node.children if c.type == "string_literal"]
+            if ids and strs:
+                prefix = _read_text(ids[0], source)
+                uri = _xq_string(strs[0])
+                if prefix and uri:
+                    ns_prefixes[prefix] = uri
+                line = node.start_point[0] + 1
+                import_nid = _make_id(prefix)
+                label = uri.split("/")[-1] if uri else f"{prefix}:module"
+                add_node(import_nid, label, line, uri=uri)
+                add_edge(file_nid, import_nid, "imports", line, context="module")
+
+        elif t == "function_declaration":
+            qname, prefix, _localname = _xq_qname(node)
+            if qname:
+                line = node.start_point[0] + 1
+                arity = 0
+                for c in node.children:
+                    if c.type == "param_list":
+                        arity = _xq_param_count(c)
+                        break
+                func_nid = _make_id(stem, qname)
+                func_ids[qname] = func_nid
+                meta: dict = {"arity": arity}
+                if prefix:
+                    meta["prefix"] = prefix
+                add_node(func_nid, f"{qname}()", line, **meta)
+                add_edge(file_nid, func_nid, "contains", line)
+            return
+
+        elif t == "variable_declaration":
+            for vn in (c for c in node.children if c.type == "variable"):
+                var_ids = [c for c in vn.children if c.type == "identifier"]
+                if var_ids:
+                    var_name = _read_text(var_ids[0], source)
+                    line = node.start_point[0] + 1
+                    var_nid = _make_id(stem, var_name)
+                    add_node(var_nid, f"${var_name}", line)
+                    add_edge(file_nid, var_nid, "contains", line)
+
+        for c in node.children:
+            collect_declarations(c)
+
+    collect_declarations(root)
+
+    # ── Pass 2: walk function bodies for calls ───────────────────────────
+
+    def walk_calls(node, func_nid: str) -> None:
+        if node.type == "function_call":
+            qname, prefix, _localname = _xq_qname(node)
+            # Skip built-in prefixes and unprefixed calls (resolve to fn: in XQuery)
+            if qname and prefix is not None and prefix not in _ML_BUILTIN_PREFIXES:
+                line = node.start_point[0] + 1
+                if qname in func_ids:
+                    target_nid = func_ids[qname]
+                else:
+                    target_nid = _make_id(qname)
+                    if target_nid not in seen_ids:
+                        add_node(target_nid, f"{qname}()", line)
+                add_edge(func_nid, target_nid, "calls", line)
+        for c in node.children:
+            walk_calls(c, func_nid)
+
+    def walk_bodies(node) -> None:
+        if node.type == "function_declaration":
+            qname, _, _ = _xq_qname(node)
+            if qname and qname in func_ids:
+                func_nid = func_ids[qname]
+                for c in node.children:
+                    if c.type == "enclosed_expr":
+                        walk_calls(c, func_nid)
+            return
+        for c in node.children:
+            walk_bodies(c)
+
+    walk_bodies(root)
+
+    return {"nodes": nodes, "edges": edges}
+
+
 _DISPATCH: dict[str, Any] = {
     ".py": extract_python,
     ".js": extract_js,
@@ -10825,6 +11037,7 @@ _DISPATCH: dict[str, Any] = {
     ".vbproj": extract_csproj,
     ".razor": extract_razor,
     ".cshtml": extract_razor,
+    ".xqy": extract_xquery,
 }
 
 
