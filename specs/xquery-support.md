@@ -12,13 +12,14 @@ Graphify's `extract()` pipeline parses source files into a knowledge graph of no
 | # | User input | Current behaviour | Expected behaviour | Verified |
 |---|---|---|---|---|
 | R1 | Directory containing `.xqy` files passed to `graphify extract` | `.xqy` files skipped — not in `CODE_EXTENSIONS`, no extractor in `_DISPATCH` | `.xqy` files parsed, nodes and edges emitted like other languages | Tested by running graphify on a MarkLogic codebase |
-| R2 | MarkLogic XQuery using `object-node { "key": value }` syntax | `grantmacken/tree-sitter-xquery` grammar produces ERROR nodes for `object-node`, `array-node`, `number-node`, `boolean-node`, `null-node` | Grammar parses all five MarkLogic JSON node constructors without errors | ✅ Phase 1: 139/144 CAS corpus clean (96.5%) |
+| R2 | MarkLogic XQuery using `object-node { "key": value }` syntax, `as object-node()` type tests, `declare private function`, `catch ($e)` | `grantmacken/tree-sitter-xquery` grammar produces ERROR nodes for MarkLogic extensions | Grammar parses all five JSON constructors, five node tests, `declare private function/variable`, and `catch ($var)` without errors | ✅ Phase 1: 139/144 CAS corpus clean (96.5%) |
 | R3 | `pip install tree-sitter-xquery` | Package not found on PyPI | Installable Python wheel published to PyPI | `pip install tree-sitter-xquery` succeeds |
-| R4 | XQuery module with `declare function au:foo($x as xs:int)` | Function not extracted as a graph node | Function declaration produces a node with label `au:foo#1` (QName#arity), kind `function`, metadata `{arity: 1, parameterStrictTyping: 1.0, hasReturnType: false}`, contained by its file node | Verified in extract output |
+| R4 | XQuery module with `declare function au:foo($x as xs:int)` | Function not extracted as a graph node | Function declaration produces a node with ID via `_make_id(file_stem, qname)` (e.g. `mymodule_au_foo`), label `au:foo()`, metadata `{kind: "function", arity: 1, parameterStrictTyping: 1.0, hasReturnType: false}`, contained by its file node. Arity is in metadata, not the ID or label. | Verified in extract output |
 | R5 | XQuery file with `import module namespace asc = "urn:asc" at "/lib/asc.xqy"` | Import not captured as an edge | Module import produces an `imports` edge from the file node with `{namespace: "urn:asc", target_path: "/lib/asc.xqy"}` in metadata. Cross-file resolution to corpus file nodes deferred to follow-up. | Verified in extract output |
-| R6 | XQuery function body calling `cts:search($x, $query)` | Call not captured | Function call produces a `calls` edge from the enclosing function node to a node for the callee (raw prefixed name; namespace resolution deferred). External callees produce stub nodes with `confidence: "UNRESOLVED"`. | Verified in extract output |
+| R6 | XQuery function body calling `cts:search($x, $query)` | Call not captured | Function call produces a `calls` edge from the enclosing function node to a node for the callee. Internal callees (declared in same file) get `confidence: "EXTRACTED"`. External callees are emitted as `raw_calls` entries for the symbol resolution pipeline (which emits `INFERRED` for unique matches, otherwise drops them). No new confidence values introduced — uses existing `EXTRACTED`/`INFERRED`/`AMBIGUOUS` set. | Verified in extract output |
 | R7 | XQuery `declare variable $MAX as xs:integer := 200` | Variable not captured | Global variable declaration produces a node with label `$MAX`, kind `variable`, contained by its file node | Verified in extract output |
-| R8 | `graphify install` with XQuery files in corpus | tree-sitter-xquery not installed as a dependency | `pyproject.toml` extras include `xquery = ["tree-sitter-xquery"]` and the `all` extra aggregates it. `extract_xquery()` returns `{nodes: [], edges: [], error: "tree-sitter-xquery not installed..."}` when absent (tested at individual extractor level, not through aggregate `extract()`). | Verified with and without package installed |
+| R8a | `pip install graphifyy[xquery]` | tree-sitter-xquery not installable | Phase 2 publishes `tree-sitter-xquery` to PyPI; Phase 3 adds `xquery = ["tree-sitter-xquery"]` to `pyproject.toml` `[project.optional-dependencies]` and adds it to the `all` aggregation | `pip install graphifyy[xquery]` succeeds after Phase 2 |
+| R8b | `.xqy` file extraction when tree-sitter-xquery not installed | Crash or silent failure | `extract_xquery()` returns `{nodes: [], edges: [], error: "tree-sitter-xquery not installed..."}` when absent (tested at individual extractor level, not through aggregate `extract()`) | Verified without package installed |
 
 ## Phases
 
@@ -27,7 +28,7 @@ Graphify's `extract()` pipeline parses source files into a knowledge graph of no
 **Status:** ✅ Complete
 **Fixes:** R2
 **Branch:** `feature/marklogic-json-constructors` on [mrleepee/tree-sitter-xquery](https://github.com/mrleepee/tree-sitter-xquery)
-**Commit:** `403c9be`
+**Commit:** `3b53ef7`
 
 #### Behaviour
 
@@ -74,8 +75,10 @@ Graphify's `extract()` pipeline parses source files into a knowledge graph of no
 - `object_node_test`, `array_node_test`, `number_node_test`, `boolean_node_test`, `null_node_test` — each `seq(keyword, '(', optional(string_literal), ')')` like `document_test`
 
 **Additional MarkLogic extensions:**
-- `function_declaration` — added `optional(seq('private', repeat($.annotation)))` between `declare` and `function`
+- `function_declaration` — added `optional('private')` between `declare` and `repeat($.annotation)`, followed by `'function'` (correct ordering: `declare [private] [%annotations] function`)
+- `variable_declaration` — added `optional('private')` for `declare private variable` support
 - `catch_clause` — added `seq('(', $.variable, ')')` as alternative to `catch_error_list`
+- All 5 MarkLogic reserved words added to `_non_delimiting_word` to preserve identifier usage (`$object-node`, `local:object-node()`, etc.)
 
 #### Not in scope
 
@@ -119,14 +122,15 @@ Graphify's `extract()` pipeline parses source files into a knowledge graph of no
 ### Phase 3 — Write `extract_xquery()` and register in Graphify
 
 **Status:** not started
-**Fixes:** R1, R4, R5, R6, R7, R8
+**Fixes:** R1, R4, R5, R6, R7, R8b
+**Prerequisites:** Phase 2 (R8a — package must be on PyPI before `graphifyy[all]` can include it)
 
 #### Behaviour
 
 - Given a `.xqy` file passed to `extract()`, when the dispatcher looks up the extension, then `extract_xquery` is returned
 - Given `xquery version "1.0-ml"; module namespace au = "urn:test"; declare function au:foo($x as xs:string) as xs:string { au:bar($x) }; declare function au:bar($x as xs:string) as xs:string { $x };`, when extracted, then the output contains:
-  - A file node with label matching the filename
-  - Two function nodes with IDs `au:foo#1` and `au:bar#1` (QName#arity), labels `au:foo()` and `au:bar()`, metadata `{arity: 1, parameterStrictTyping: 1.0, hasReturnType: true}`, with `contains` edges from the file node
+  - A file node with ID `_make_id(file_stem)`, label matching the filename
+  - Two function nodes with IDs `_make_id(file_stem, "au:foo")` / `_make_id(file_stem, "au:bar")` (normalized: punctuation stripped, casefolded), labels `au:foo()` and `au:bar()`, metadata `{kind: "function", arity: 1, parameterStrictTyping: 1.0, hasReturnType: true}`, with `contains` edges from the file node
   - A `calls` edge from `au:foo` to `au:bar` with confidence `EXTRACTED`
 - Given `import module namespace asc = "urn:asc" at "/lib/asc.xqy";`, when extracted, then the output contains an `imports` edge from the file node with metadata `{namespace: "urn:asc", target_path: "/lib/asc.xqy"}`
 - Given `declare variable $MAX as xs:integer := 200;`, when extracted, then the output contains a variable node `$MAX` with a `contains` edge from the file node
@@ -145,22 +149,25 @@ All registration happens in this phase (merged with what was previously Phase 4)
 | `graphify/watch.py` | Pick up extension from `CODE_EXTENSIONS` (no change if already derives from `detect`) |
 | `pyproject.toml` | Add `xquery = ["tree-sitter-xquery"]` to `[project.optional-dependencies]` |
 | `pyproject.toml` | Add `"tree-sitter-xquery"` to the `all` extra aggregation |
-| `README.md` | Add XQuery to supported languages table |
+| `uv.lock` | Regenerate lockfile to include tree-sitter-xquery in xquery/all resolution |
+| `README.md` | Add XQuery to supported languages table AND optional extras table (alongside `sql`, `dm`, `terraform`) |
 
 #### Verification
 
 | Input | Expected output | Verified result |
 |---|---|---|
-| `module.xqy` (simple library module) | File node + function nodes with `contains` edges; function IDs include arity | |
+| `module.xqy` (simple library module) | File node + function nodes with `contains` edges; function IDs via `_make_id(stem, qname)`, labels `au:foo()`, metadata includes `arity`, `parameterStrictTyping`, `hasReturnType` | |
 | File with `import module ... at "path"` | `imports` edge with `{namespace, target_path}` in metadata | |
-| File with `cts:search()` call | `calls` edge from enclosing function to callee stub node, confidence `UNRESOLVED` | |
+| File with `cts:search()` call | Internal: `calls` edge, confidence `EXTRACTED`. External: emitted as `raw_calls` for symbol resolution pipeline | |
 | File with `declare variable $X` | Variable node `$X` + `contains` edge | |
 | File with `object-node {}` | No error in output (Phase 1 grammar) | |
 | `.xqy` file without tree-sitter-xquery installed | `extract_xquery()` returns error dict; no crash | |
+| `collect_files(dir)` with `.xqy` files | Files returned in file list (derives from `_DISPATCH.keys()`) | |
 | `graphify detect` on directory with `.xqy` | Files appear in `code` list | |
 | `graphify watch` on directory with `.xqy` | Change events emitted for modifications | |
-| `pip install graphify[xquery]` | Installs tree-sitter-xquery | |
-| `pip install graphify[all]` | Includes tree-sitter-xquery | |
+| `pip install graphifyy[xquery]` | Installs tree-sitter-xquery (requires Phase 2) | |
+| `pip install graphifyy[all]` | Includes tree-sitter-xquery (requires Phase 2) | |
+| Overloaded functions `au:foo#1` and `au:foo#2` | Distinct node IDs via `_make_id(stem, qname)` + arity in metadata; labels both `au:foo()` | |
 
 #### Not in scope
 
@@ -168,7 +175,7 @@ All registration happens in this phase (merged with what was previously Phase 4)
 - Per-function call attribution with namespace resolution (resolving prefixed calls like `cts:search` to their module) — deferred
 - Variable reference tracking (`$x` references) — deferred
 - `xdmp:eval` / `xdmp:value` dynamic function detection — deferred
-- `.xq` / `.xqm` / `.xql` extensions — rare in MarkLogic ecosystems where `.xqy` is standard; can be added to `_DISPATCH` trivially
+- `.xq` / `.xqm` / `.xql` extensions — rare in MarkLogic ecosystems where `.xqy` is standard; must not be added unless a new requirement is approved
 
 ## Constraints
 
@@ -177,13 +184,13 @@ All registration happens in this phase (merged with what was previously Phase 4)
 - **Follow existing patterns.** The extractor must follow the same structure as `extract_sql()` or `extract_bash()` — import tree-sitter, parse, walk AST, return `{nodes, edges}`.
 - **Test with real corpus.** Verification uses the 144-file CAS MarkLogic XQuery corpus at `/Users/lpollington/Dev/cas/repos/ls-prime-schema-analyser/marklogic/src/main/ml-modules/root/`.
 - **Grammar fork ownership.** The forked grammar lives at [mrleepee/tree-sitter-xquery](https://github.com/mrleepee/tree-sitter-xquery) — a permanent namespace for the PyPI package source.
-- **Tree-sitter ABI compatibility.** The grammar's `LANGUAGE_VERSION` (currently 14 in `src/parser.c`) must be regenerated and tested against Graphify's `tree-sitter>=0.23.0` runtime before Phase 2 publishing.
+- **Tree-sitter ABI compatibility.** The grammar's `LANGUAGE_VERSION` is currently 14 in `src/parser.c`. Graphify requires `tree-sitter>=0.23.0` and rejects runtimes with `LANGUAGE_VERSION < 14`. Before Phase 2 publishing, the parser must be tested against both Graphify's minimum runtime (`0.23.0`) and the locked runtime to confirm compatibility — regenerating to a newer ABI version would actually force raising the minimum runtime.
 
 ## Not In Scope
 
 - **Cross-file import resolution:** Resolving `import module ... at "path"` to actual file nodes requires a two-pass resolution across all extracted files. Deferred as a dependency — needs the single-file extractor working first.
 - **Namespace-resolved call edges:** Resolving `cts:search()` to `http://marklogic.com/cts#search` requires a namespace resolution table built from imports and module declarations. Deferred as complexity.
-- **`.xq` / `.xqm` / `.xql` extensions:** Rare in MarkLogic ecosystems where `.xqy` is standard. Can be added trivially to `_DISPATCH` later.
+- **`.xq` / `.xqm` / `.xql` extensions:** Rare in MarkLogic ecosystems where `.xqy` is standard. Must not be added in Phase 3 unless a new requirement is approved.
 - **XQuery Scripting Extension / MarkLogic Update syntax:** These are rarely used in library modules and would require grammar extensions beyond the JSON constructors.
 - **Per-function variable reference tracking:** Tracking `$var-ref` → `declare variable $var` edges is a separate extraction concern deferred to a follow-up.
 - **Pre-existing comment parsing edge cases:** The upstream grammar has known issues with deeply nested comments and `~:)` endings (5/144 files). These are independent of MarkLogic extensions and not addressed here.
@@ -358,3 +365,30 @@ This spec was reviewed using codex-cli (read-only sandbox). The following findin
 | 7 | Medium | Packaging plan inconsistent (Linux ARM excluded vs included); `language()` return type unspecified | Resolved: exclude Linux ARM from both; specified PyCapsule return type |
 | 8 | Medium | Function identity missing arity (XQuery = name+arity) | Added arity to node IDs (`au:foo#1`) and metadata |
 | 9 | Low | Verification tables too outcome-light | Added specific IDs, metadata, edge confidence, stub node behaviour to Phase 3 table |
+
+### A7. Second-round review findings (grammar)
+
+Grammar changes reviewed by codex-cli against grammar.js diff and MarkLogic docs.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| G1 | High | MarkLogic reserved words not in `_non_delimiting_word` — breaks `$object-node`, `local:object-node()`, `<object-node/>`, `%object-node` | ✅ Fixed: added all 5 words to `_non_delimiting_word` in alphabetical order |
+| G2 | Medium | `declare %a private %b function` accepted but MarkLogic only supports `declare private function` | ✅ Fixed: restructured to `declare optional('private') repeat(annotation) 'function'` |
+| G3 | Medium | `declare private variable` not supported | ✅ Fixed: added `optional('private')` to `variable_declaration` |
+| G4 | Low | `json_object_content` approach validated as correct vs `enclosed_expr` | Confirmed correct — `:` is not an XQuery operator in expression context |
+| G5 | Low | `catch($var)` safe — no conflict with `catch_error_list` | Confirmed safe |
+
+### A8. Second-round review findings (spec)
+
+Spec reviewed by codex-cli against Graphify codebase (extract.py, detect.py, watch.py, pyproject.toml, tests).
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| S1 | High | `UNRESOLVED` not a valid confidence — pipeline only accepts `EXTRACTED`, `INFERRED`, `AMBIGUOUS` | ✅ Fixed: R6 now uses `raw_calls` for external callees; no new confidence values |
+| S2 | High | Function IDs use `_make_id()` which strips punctuation and casefolds; `au:foo#1` would become `aufoo1` | ✅ Fixed: IDs defined as `_make_id(file_stem, qname)`, labels human-readable `au:foo()`, arity in metadata |
+| S3 | High | R8 depends on both Phase 2 (publishing) and Phase 3 (wiring) | ✅ Fixed: split into R8a (Phase 2 prerequisite) and R8b (Phase 3 extractor) |
+| S4 | Medium | Package name is `graphifyy` (double-y), not `graphify` | ✅ Fixed: all pip commands now use `graphifyy[xquery]`, `graphifyy[all]` |
+| S5 | Medium | Phase 3 verification missing `collect_files()` directory test | ✅ Fixed: added `collect_files(dir)` verification row |
+| S6 | Medium | Phase 1 deliverables (node tests, private, catch) not traced to R2 | ✅ Fixed: R2 now explicitly covers all Phase 1 extensions |
+| S7 | Medium | README deliverable missing optional extras table | ✅ Fixed: registration table now includes README extras table + uv.lock |
+| S8 | Low | Grammar ABI warning imprecise — LANGUAGE_VERSION 14 may already be compatible | ✅ Fixed: constraint now says "test against minimum and locked runtime" not "regenerate" |
