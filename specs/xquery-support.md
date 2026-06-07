@@ -117,7 +117,7 @@ Graphify's `extract()` pipeline parses source files into a knowledge graph of no
 
 - Publishing to conda-forge or other registries
 - Linux ARM64 or Windows wheels (can add later if needed)
-- The `LANGUAGE_VERSION` in `src/parser.c` is 14 — must be regenerated against Graphify's tree-sitter version before publishing
+- The `LANGUAGE_VERSION` in `src/parser.c` is 14 — test against both Graphify's minimum runtime (`0.23.0`) and the locked runtime before publishing
 
 ### Phase 3 — Write `extract_xquery()` and register in Graphify
 
@@ -167,7 +167,7 @@ All registration happens in this phase (merged with what was previously Phase 4)
 | `graphify watch` on directory with `.xqy` | Change events emitted for modifications | |
 | `pip install graphifyy[xquery]` | Installs tree-sitter-xquery (requires Phase 2) | |
 | `pip install graphifyy[all]` | Includes tree-sitter-xquery (requires Phase 2) | |
-| Overloaded functions `au:foo#1` and `au:foo#2` | Distinct node IDs via `_make_id(stem, qname)` + arity in metadata; labels both `au:foo()` | |
+| Overloaded functions `au:foo#1` and `au:foo#2` | Distinct node IDs via `_make_id(stem, qname, arity)` (arity appended to disambiguate overloads); labels both `au:foo()`; metadata `{arity: N}` | |
 
 #### Not in scope
 
@@ -348,7 +348,7 @@ The package targets `tree-sitter>=0.23.0` (Graphify's minimum) and provides pre-
 - macOS x86_64
 - Linux x86_64
 
-**Important:** The `LANGUAGE_VERSION` in `src/parser.c` (currently 14) must be regenerated against the target tree-sitter runtime version to avoid ABI incompatibility.
+**Important:** The `LANGUAGE_VERSION` in `src/parser.c` is currently 14. Graphify requires `tree-sitter>=0.23.0` and rejects runtimes with `LANGUAGE_VERSION < 14`. Test the published grammar against both Graphify's minimum runtime and the locked runtime — regenerating to a newer ABI would force raising the minimum.
 
 ### A6. Review findings incorporated
 
@@ -363,7 +363,7 @@ This spec was reviewed using codex-cli (read-only sandbox). The following findin
 | 5 | Medium | Error handling didn't match aggregate `extract()` | Clarified: tested at `extract_xquery()` level, not through aggregate `extract()` |
 | 6 | Medium | R1 split across Phase 3 & 4; two registration points (`_DISPATCH` + `CODE_EXTENSIONS`) | Merged Phase 4 into Phase 3; added registration table |
 | 7 | Medium | Packaging plan inconsistent (Linux ARM excluded vs included); `language()` return type unspecified | Resolved: exclude Linux ARM from both; specified PyCapsule return type |
-| 8 | Medium | Function identity missing arity (XQuery = name+arity) | Added arity to node IDs (`au:foo#1`) and metadata |
+| 8 | Medium | Function identity missing arity (XQuery = name+arity) | Added arity to function metadata; IDs use `_make_id(stem, qname, arity)` for overload disambiguation; labels are human-readable `au:foo()` |
 | 9 | Low | Verification tables too outcome-light | Added specific IDs, metadata, edge confidence, stub node behaviour to Phase 3 table |
 
 ### A7. Second-round review findings (grammar)
