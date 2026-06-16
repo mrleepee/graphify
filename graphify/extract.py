@@ -10813,11 +10813,13 @@ def extract_xquery(path: Path) -> dict:
     ns_prefixes: dict[str, str] = {}
     func_ids: dict[str, str] = {}
 
-    def add_node(nid: str, label: str, line: int, **metadata) -> None:
+    def add_node(nid: str, label: str, line: int, kind: str | None = None, **metadata) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
             node = {"id": nid, "label": label, "file_type": "code",
                     "source_file": str_path, "source_location": f"L{line}"}
+            if kind:
+                node["kind"] = kind
             if metadata:
                 node["metadata"] = metadata
             nodes.append(node)
@@ -10854,7 +10856,7 @@ def extract_xquery(path: Path) -> dict:
         return sum(1 for c in param_list_node.children if c.type == "$")
 
     file_nid = _make_id(str_path)
-    add_node(file_nid, path.name, 1)
+    add_node(file_nid, path.name, 1, kind="file")
 
     # ── Pass 1: collect declarations and imports ──────────────────────────
 
@@ -10870,7 +10872,7 @@ def extract_xquery(path: Path) -> dict:
                     ns_prefixes[prefix] = uri
                     line = node.start_point[0] + 1
                     mod_nid = _make_id(stem, "module", prefix)
-                    add_node(mod_nid, f"module:{prefix}", line, uri=uri, prefix=prefix)
+                    add_node(mod_nid, f"module:{prefix}", line, kind="module", uri=uri, prefix=prefix)
                     add_edge(file_nid, mod_nid, "contains", line)
 
         elif t == "module_import":
@@ -10884,7 +10886,7 @@ def extract_xquery(path: Path) -> dict:
                 line = node.start_point[0] + 1
                 import_nid = _make_id(prefix)
                 label = uri.split("/")[-1] if uri else f"{prefix}:module"
-                add_node(import_nid, label, line, uri=uri)
+                add_node(import_nid, label, line, kind="namespace", uri=uri)
                 add_edge(file_nid, import_nid, "imports", line, context="module")
 
         elif t == "function_declaration":
@@ -10901,7 +10903,7 @@ def extract_xquery(path: Path) -> dict:
                 meta: dict = {"arity": arity}
                 if prefix:
                     meta["prefix"] = prefix
-                add_node(func_nid, f"{qname}()", line, **meta)
+                add_node(func_nid, f"{qname}()", line, kind="function", **meta)
                 add_edge(file_nid, func_nid, "contains", line)
             return
 
@@ -10912,7 +10914,7 @@ def extract_xquery(path: Path) -> dict:
                     var_name = _read_text(var_ids[0], source)
                     line = node.start_point[0] + 1
                     var_nid = _make_id(stem, var_name)
-                    add_node(var_nid, f"${var_name}", line)
+                    add_node(var_nid, f"${var_name}", line, kind="variable")
                     add_edge(file_nid, var_nid, "contains", line)
 
         for c in node.children:
@@ -10933,7 +10935,7 @@ def extract_xquery(path: Path) -> dict:
                 else:
                     target_nid = _make_id(qname)
                     if target_nid not in seen_ids:
-                        add_node(target_nid, f"{qname}()", line)
+                        add_node(target_nid, f"{qname}()", line, kind="function")
                 add_edge(func_nid, target_nid, "calls", line)
         for c in node.children:
             walk_calls(c, func_nid)
